@@ -3,21 +3,23 @@ module main
 import os
 import flag
 import net.http
+import net
 import sync
 import rand
 import time
 
-const default_user_agents =[
+const default_user_agents = [
 	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
 	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15',
 	'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/113.0',
 	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 Edg/114.0.1823.43',
-	'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1'
+	'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
 ]
 
-fn worker(worker_id int, ch chan string, ua_list[]string, mut wg sync.WaitGroup, timeout_sec int, redirect int) {
-	defer { wg.done() }
-	mut final_red := false
+fn worker(worker_id int, ch chan string, ua_list []string, mut wg sync.WaitGroup, timeout_sec int, redirect int) {
+	defer {
+		wg.done()
+	}
 
 	for {
 		url := <-ch or { break }
@@ -25,28 +27,43 @@ fn worker(worker_id int, ch chan string, ua_list[]string, mut wg sync.WaitGroup,
 		ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
 		random_ua := ua_list[ua_idx]
 		
-		if redirect != 0 { final_red = true }
-		fetch_config := http.FetchConfig{
-			url: url
-			method: .head
-			user_agent: random_ua
-			allow_redirect: final_red 
+		mut host := url.all_after('://').all_before('/')
+		if host == '' { host = url }
+		if !host.contains(':') { host += ':80' }
+		
+		mut conn := net.dial_tcp(host) or {
+			println('[Worker $worker_id] [!] Connection Failed: $url')
+			continue
 		}
 		
-		resp := http.fetch(fetch_config) or {
+		conn.set_read_timeout(timeout_sec * time.second)
+		conn.set_write_timeout(timeout_sec * time.second)
+		
+		head_request := 'HEAD / HTTP/1.1\r\nHost: $host\r\nUser-Agent: $random_ua\r\nConnection: close\r\n\r\n'
+		conn.write_string(head_request) or {
+			conn.close() or {}
+			continue
+		}
+		
+		mut buf := []u8{len: 1024}
+		n := conn.read(mut buf) or {
 			println('[Worker $worker_id] [!] Timeout/Blocked: $url')
+			conn.close() or {}
 			continue
 		}
 
-		println('[Worker $worker_id] [✔] Obfuscated Visit: $url (Status: $resp.status_code)')
-		
+		if n > 0 {
+			println('[Worker $worker_id] [✔] Obfuscated Visit: $url (Success)')
+		}
+
+		conn.close() or {}
 		time.sleep(10 * time.millisecond)
 	}
 }
 
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
-	fp.application('Envelope')
+	fp.application('Envelop')
 	fp.version('1.3.0')
 	fp.description('Generates background HTTP HEAD requests to obfuscate real web traffic.')
 	fp.skip_executable()
@@ -71,7 +88,7 @@ fn main() {
 	}
 
 	println('[*] Starting Envelope Session...')
-	
+
 	mut raw_content := ''
 	if list_arg.starts_with('http://') || list_arg.starts_with('https://') {
 		println('[*] Downloading site list from URL: $list_arg')
@@ -88,7 +105,7 @@ fn main() {
 		}
 	}
 
-	mut sites :=[]string{}
+	mut sites := []string{}
 	for line in raw_content.split_into_lines() {
 		trimmed := line.trim_space()
 		if trimmed != '' {
@@ -105,7 +122,7 @@ fn main() {
 		exit(1)
 	}
 	println('[*] Successfully loaded ${sites.len} sites.')
-	
+
 	mut user_agents := default_user_agents.clone()
 	if ua_arg != '' {
 		mut raw_ua_content := ''
@@ -124,7 +141,7 @@ fn main() {
 			}
 		}
 
-		mut loaded_uas :=[]string{}
+		mut loaded_uas := []string{}
 		for line in raw_ua_content.split_into_lines() {
 			trimmed := line.trim_space()
 			if trimmed != '' {
@@ -139,18 +156,18 @@ fn main() {
 			println('[!] Warning: Provided User-Agent list is empty, falling back to defaults.')
 		}
 	}
-	
+
 	println('[*] Configuration: $workers_arg workers | $timeout_arg sec timeout | $count_arg total requests\n')
 
 	mut wg := sync.new_waitgroup()
 	wg.add(workers_arg)
 
 	mut jobs := chan string{cap: 1000}
-	
+
 	for i in 1 .. (workers_arg + 1) {
 		spawn worker(i, jobs, user_agents, mut wg, timeout_arg, redirect_arg)
 	}
-	
+
 	for _ in 0 .. count_arg {
 		idx := rand.int_in_range(0, sites.len) or { 0 }
 		jobs <- sites[idx]
