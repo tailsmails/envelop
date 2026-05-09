@@ -27,7 +27,7 @@ apt update -y && apt install -y git clang make && if ! command -v v >/dev/null 2
 3. Compile the application using the V compiler. For the best performance, compile it with the production flag:
 
 ```bash
-v -prod main.v -o envelop
+v -prod envelop.v -o envelop
 ```
 
 ---
