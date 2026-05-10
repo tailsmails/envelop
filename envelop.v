@@ -21,7 +21,7 @@ import sync
 import rand
 import time
 
-const default_user_agents = [
+const default_user_agents =[
 	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
 	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15',
 	'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/113.0',
@@ -29,7 +29,30 @@ const default_user_agents = [
 	'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
 ]
 
-fn worker(worker_id int, ch chan string, ua_list []string, mut wg sync.WaitGroup, timeout_sec int, redirect int) {
+fn dial_proxy(proxy_addr string, host string, port int) !&net.TcpConn {
+	mut c := net.dial_tcp(proxy_addr)!
+	c.write([u8(5), 1, 0])!
+	mut g :=[]u8{len: 2}
+	c.read(mut g)!
+	if g[0] != 5 || g[1] != 0 {
+		c.close() or {}
+		return error('auth')
+	}
+	mut r := [u8(5), 1, 0, 3, u8(host.len)]
+	r << host.bytes()
+	r << u8(port >> 8)
+	r << u8(port & 0xff)
+	c.write(r)!
+	mut rsp :=[]u8{len: 256}
+	c.read(mut rsp)!
+	if rsp[1] != 0 {
+		c.close() or {}
+		return error('refused')
+	}
+	return c
+}
+
+fn worker(worker_id int, ch chan string, ua_list[]string, mut wg sync.WaitGroup, timeout_sec int, redirect int, proxy_addr string) {
 	defer {
 		wg.done()
 	}
@@ -44,9 +67,18 @@ fn worker(worker_id int, ch chan string, ua_list []string, mut wg sync.WaitGroup
 		if host == '' { host = url }
 		if !host.contains(':') { host += ':80' }
 		
-		mut conn := net.dial_tcp(host) or {
-			println('[Worker $worker_id] [!] Connection Failed: $url')
-			continue
+		mut conn := if proxy_addr != '' {
+			target_host := host.all_before_last(':')
+			target_port := host.all_after_last(':').int()
+			dial_proxy(proxy_addr, target_host, target_port) or {
+				println('[Worker $worker_id] [!] Proxy Connection Failed: $url')
+				continue
+			}
+		} else {
+			net.dial_tcp(host) or {
+				println('[Worker $worker_id] [!] Connection Failed: $url')
+				continue
+			}
 		}
 		
 		conn.set_read_timeout(timeout_sec * time.second)
@@ -58,9 +90,9 @@ fn worker(worker_id int, ch chan string, ua_list []string, mut wg sync.WaitGroup
 			continue
 		}
 		
-		mut buf := []u8{len: 1024}
+		mut buf :=[]u8{len: 1024}
 		n := conn.read(mut buf) or {
-			println('[Worker $worker_id] [!] Timeout/Blocked: $url')
+			println('[Worker $worker_id][!] Timeout/Blocked: $url')
 			conn.close() or {}
 			continue
 		}
@@ -83,6 +115,7 @@ fn main() {
 
 	list_arg := fp.string('list', `l`, '', 'Path or URL containing the site list [Required]')
 	ua_arg := fp.string('user-agents', `u`, '', 'Path or URL to custom User-Agents list [Optional]')
+	proxy_arg := fp.string('proxy', `p`, '', 'SOCKS5 proxy address (e.g. 127.0.0.1:9050) [Optional]')
 	timeout_arg := fp.int('timeout', `t`, 5, 'Timeout for HTTP requests in seconds')
 	workers_arg := fp.int('workers', `w`, 10, 'Number of concurrent workers (threads)')
 	redirect_arg := fp.int('redirect', `r`, 0, 'If you want to enable redirect (0 for false/any for true)')
@@ -118,7 +151,7 @@ fn main() {
 		}
 	}
 
-	mut sites := []string{}
+	mut sites :=[]string{}
 	for line in raw_content.split_into_lines() {
 		trimmed := line.trim_space()
 		if trimmed != '' {
@@ -154,7 +187,7 @@ fn main() {
 			}
 		}
 
-		mut loaded_uas := []string{}
+		mut loaded_uas :=[]string{}
 		for line in raw_ua_content.split_into_lines() {
 			trimmed := line.trim_space()
 			if trimmed != '' {
@@ -170,7 +203,11 @@ fn main() {
 		}
 	}
 
-	println('[*] Configuration: $workers_arg workers | $timeout_arg sec timeout | $count_arg total requests\n')
+	if proxy_arg != '' {
+		println('[*] Configuration: $workers_arg workers | $timeout_arg sec timeout | $count_arg total requests | Proxy: $proxy_arg\n')
+	} else {
+		println('[*] Configuration: $workers_arg workers | $timeout_arg sec timeout | $count_arg total requests\n')
+	}
 
 	mut wg := sync.new_waitgroup()
 	wg.add(workers_arg)
@@ -178,7 +215,7 @@ fn main() {
 	mut jobs := chan string{cap: 1000}
 
 	for i in 1 .. (workers_arg + 1) {
-		spawn worker(i, jobs, user_agents, mut wg, timeout_arg, redirect_arg)
+		spawn worker(i, jobs, user_agents, mut wg, timeout_arg, redirect_arg, proxy_arg)
 	}
 
 	for _ in 0 .. count_arg {
