@@ -17,6 +17,8 @@ import os
 import flag
 import net.http
 import net.urllib
+import net
+import net.ssl
 import sync
 import rand
 import time
@@ -56,7 +58,7 @@ fn (shared s AppState) report_failure(url string) {
 					f.writeln(site) or { break }
 				}
 				f.close()
-				println('[*] [!] Site ${url} removed from active list due to repeated timeouts.')
+				println('[*] [!] Site ${url} removed from active list due to repeated failures.')
 			}
 		}
 	}
@@ -103,51 +105,123 @@ fn find_related_internal(url string, sites []string) string {
 	return ''
 }
 
+fn dial_proxy(proxy_addr string, host string, port int) !&net.TcpConn {
+	mut addr := proxy_addr
+	if addr.contains('://') {
+		addr = addr.all_after('://')
+	}
+	mut c := net.dial_tcp(addr)!
+	c.write([u8(5), 1, 0])!
+	mut g := []u8{len: 2}
+	c.read(mut g)!
+	if g[0] != 5 || g[1] != 0 {
+		c.close() or {}
+		return error('socks5 auth failed')
+	}
+	mut r := [u8(5), 1, 0, 3, u8(host.len)]
+	r << host.bytes()
+	r << u8(port >> 8)
+	r << u8(port & 0xff)
+	c.write(r)!
+	mut rsp := []u8{len: 256}
+	c.read(mut rsp)!
+	if rsp[1] != 0 {
+		c.close() or {}
+		return error('socks5 connection refused')
+	}
+	return c
+}
+
 fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGroup, timeout_sec int, redirect int, proxy_addr string, shared state AppState) {
 	defer {
 		wg.done()
 	}
 
-	mut proxy := &http.HttpProxy(unsafe { nil })
-	if proxy_addr != '' {
-		p_url := if proxy_addr.contains('://') { proxy_addr } else { 'socks5://' + proxy_addr }
-		proxy = http.new_http_proxy(p_url) or {
-			eprintln('[Worker ${worker_id}] [!] Invalid Proxy: ${err}')
-			unsafe { nil }
-		}
-	}
-
 	for {
 		site := <-jobs or { break }
 
-		mut url := site
-		if !url.starts_with('http://') && !url.starts_with('https://') {
-			url = 'https://' + url
+		mut url_str := site
+		if !url_str.contains('://') {
+			url_str = 'https://' + url_str
 		}
 
-		ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
-		random_ua := ua_list[ua_idx]
-
-		mut config := http.FetchConfig{
-			url: url
-			method: .head
-			user_agent: random_ua
-			read_timeout: timeout_sec * time.second
-			write_timeout: timeout_sec * time.second
-			allow_redirect: redirect != 0
-			proxy: proxy
-		}
-
-		resp := http.fetch(config) or {
-			println('[Worker ${worker_id}] [!] Connection Failed: ${url} (${err})')
-			state.report_failure(site)
+		u := urllib.parse(url_str) or {
+			println('[Worker ${worker_id}] [!] Invalid URL: ${url_str}')
 			continue
 		}
 
-		if resp.status_code >= 200 && resp.status_code < 400 {
-			println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url} (Success)')
+		is_https := u.scheme == 'https'
+		host := u.hostname()
+		mut port := u.port().int()
+		if port == 0 {
+			port = if is_https { 443 } else { 80 }
+		}
+
+		mut conn := if proxy_addr != '' {
+			dial_proxy(proxy_addr, host, port) or {
+				println('[Worker ${worker_id}] [!] Proxy Connection Failed for ${url_str}: ${err}')
+				state.report_failure(site)
+				continue
+			}
 		} else {
-			println('[Worker ${worker_id}] [!] Visit: ${url} (Status ${resp.status_code})')
+			net.dial_tcp('${host}:${port}') or {
+				println('[Worker ${worker_id}] [!] Connection Failed: ${url_str} (${err})')
+				state.report_failure(site)
+				continue
+			}
+		}
+
+		conn.set_read_timeout(timeout_sec * time.second)
+		conn.set_write_timeout(timeout_sec * time.second)
+
+		ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
+		random_ua := ua_list[ua_idx]
+		path := if u.path == '' { '/' } else { u.path }
+		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: close\r\n\r\n'
+
+		if is_https {
+			mut s := ssl.new_ssl_conn() or {
+				println('[Worker ${worker_id}] [!] SSL Initialization Failed: ${err}')
+				conn.close() or {}
+				continue
+			}
+			s.connect(mut conn, host) or {
+				println('[Worker ${worker_id}] [!] SSL Handshake Failed for ${url_str}: ${err}')
+				state.report_failure(site)
+				conn.close() or {}
+				continue
+			}
+			s.write_string(head_request) or {
+				s.close() or {}
+				continue
+			}
+			mut buf := []u8{len: 1024}
+			n := s.read(mut buf) or {
+				println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
+				state.report_failure(site)
+				s.close() or {}
+				continue
+			}
+			if n > 0 {
+				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
+			}
+			s.close() or {}
+		} else {
+			conn.write_string(head_request) or {
+				conn.close() or {}
+				continue
+			}
+			mut buf := []u8{len: 1024}
+			n := conn.read(mut buf) or {
+				println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
+				state.report_failure(site)
+				conn.close() or {}
+				continue
+			}
+			if n > 0 {
+				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
+			}
+			conn.close() or {}
 		}
 
 		// Random dwell time: 2 to 7 seconds to look like a real user
@@ -159,7 +233,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('Envelop')
-	fp.version('1.4.0')
+	fp.version('1.4.1')
 	fp.description('Generates background HTTP HEAD requests to obfuscate real web traffic.')
 	fp.skip_executable()
 
