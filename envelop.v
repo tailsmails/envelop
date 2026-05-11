@@ -16,12 +16,15 @@ module main
 import os
 import flag
 import net.http
+import net.urllib
 import net
+import net.ssl
 import sync
 import rand
 import time
+import crypto.md5
 
-const default_user_agents =[
+const default_user_agents = [
 	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
 	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15',
 	'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/113.0',
@@ -29,87 +32,208 @@ const default_user_agents =[
 	'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
 ]
 
+struct AppState {
+mut:
+	sites          []string
+	active_path    string
+	failure_counts map[string]int
+}
+
+fn (shared s AppState) report_failure(url string) {
+	lock s {
+		s.failure_counts[url]++
+		if s.failure_counts[url] >= 3 {
+			mut idx := -1
+			for i, s_url in s.sites {
+				if s_url == url {
+					idx = i
+					break
+				}
+			}
+			if idx != -1 {
+				s.sites.delete(idx)
+				// Update the active list file
+				mut f := os.create(s.active_path) or { return }
+				for site in s.sites {
+					f.writeln(site) or { break }
+				}
+				f.close()
+				println('[*] [!] Site ${url} removed from active list due to repeated failures.')
+			}
+		}
+	}
+}
+
+fn get_base_domain(hostname string) string {
+	parts := hostname.split('.')
+	if parts.len <= 2 {
+		return hostname
+	}
+	return parts[parts.len - 2] + '.' + parts[parts.len - 1]
+}
+
+fn find_related_internal(url string, sites []string) string {
+	mut u_str := url
+	if !u_str.contains('://') {
+		u_str = 'https://' + u_str
+	}
+	u := urllib.parse(u_str) or { return '' }
+	host := u.hostname()
+	base := get_base_domain(host)
+
+	mut related_pool := []string{}
+	for site in sites {
+		if site == url {
+			continue
+		}
+		mut su_str := site
+		if !su_str.contains('://') {
+			su_str = 'https://' + su_str
+		}
+		su := urllib.parse(su_str) or { continue }
+		shost := su.hostname()
+		if shost.ends_with(base) {
+			related_pool << site
+		}
+	}
+
+	if related_pool.len > 0 {
+		ridx := rand.int_in_range(0, related_pool.len) or { 0 }
+		println('[*] Simulating session: Found related domain ${related_pool[ridx]} for ${url}')
+		return related_pool[ridx]
+	}
+	return ''
+}
+
 fn dial_proxy(proxy_addr string, host string, port int) !&net.TcpConn {
-	mut c := net.dial_tcp(proxy_addr)!
+	mut addr := proxy_addr
+	if addr.contains('://') {
+		addr = addr.all_after('://')
+	}
+	mut c := net.dial_tcp(addr)!
 	c.write([u8(5), 1, 0])!
-	mut g :=[]u8{len: 2}
+	mut g := []u8{len: 2}
 	c.read(mut g)!
 	if g[0] != 5 || g[1] != 0 {
 		c.close() or {}
-		return error('auth')
+		return error('socks5 auth failed')
 	}
 	mut r := [u8(5), 1, 0, 3, u8(host.len)]
 	r << host.bytes()
 	r << u8(port >> 8)
 	r << u8(port & 0xff)
 	c.write(r)!
-	mut rsp :=[]u8{len: 256}
+	mut rsp := []u8{len: 256}
 	c.read(mut rsp)!
 	if rsp[1] != 0 {
 		c.close() or {}
-		return error('refused')
+		return error('socks5 connection refused')
 	}
 	return c
 }
 
-fn worker(worker_id int, ch chan string, ua_list[]string, mut wg sync.WaitGroup, timeout_sec int, redirect int, proxy_addr string) {
+fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGroup, timeout_sec int, redirect int, proxy_addr string, shared state AppState) {
 	defer {
 		wg.done()
 	}
 
 	for {
-		url := <-ch or { break }
+		site := <-jobs or { break }
 
-		ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
-		random_ua := ua_list[ua_idx]
-		
-		mut host := url.all_after('://').all_before('/')
-		if host == '' { host = url }
-		if !host.contains(':') { host += ':80' }
-		
+		mut url_str := site
+		if !url_str.contains('://') {
+			url_str = 'https://' + url_str
+		}
+
+		u := urllib.parse(url_str) or {
+			println('[Worker ${worker_id}] [!] Invalid URL: ${url_str}')
+			continue
+		}
+
+		is_https := u.scheme == 'https'
+		host := u.hostname()
+		mut port := u.port().int()
+		if port == 0 {
+			port = if is_https { 443 } else { 80 }
+		}
+
 		mut conn := if proxy_addr != '' {
-			target_host := host.all_before_last(':')
-			target_port := host.all_after_last(':').int()
-			dial_proxy(proxy_addr, target_host, target_port) or {
-				println('[Worker $worker_id] [!] Proxy Connection Failed: $url')
+			dial_proxy(proxy_addr, host, port) or {
+				println('[Worker ${worker_id}] [!] Proxy Connection Failed for ${url_str}: ${err}')
+				state.report_failure(site)
 				continue
 			}
 		} else {
-			net.dial_tcp(host) or {
-				println('[Worker $worker_id] [!] Connection Failed: $url')
+			net.dial_tcp('${host}:${port}') or {
+				println('[Worker ${worker_id}] [!] Connection Failed: ${url_str} (${err})')
+				state.report_failure(site)
 				continue
 			}
 		}
-		
+
 		conn.set_read_timeout(timeout_sec * time.second)
 		conn.set_write_timeout(timeout_sec * time.second)
-		
-		head_request := 'HEAD / HTTP/1.1\r\nHost: $host\r\nUser-Agent: $random_ua\r\nConnection: close\r\n\r\n'
-		conn.write_string(head_request) or {
+
+		ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
+		random_ua := ua_list[ua_idx]
+		path := if u.path == '' { '/' } else { u.path }
+		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: close\r\n\r\n'
+
+		if is_https {
+			mut s := ssl.new_ssl_conn() or {
+				println('[Worker ${worker_id}] [!] SSL Initialization Failed: ${err}')
+				conn.close() or {}
+				continue
+			}
+			s.connect(mut conn, host) or {
+				println('[Worker ${worker_id}] [!] SSL Handshake Failed for ${url_str}: ${err}')
+				state.report_failure(site)
+				conn.close() or {}
+				continue
+			}
+			s.write_string(head_request) or {
+				s.close() or {}
+				continue
+			}
+			mut buf := []u8{len: 1024}
+			n := s.read(mut buf) or {
+				println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
+				state.report_failure(site)
+				s.close() or {}
+				continue
+			}
+			if n > 0 {
+				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
+			}
+			s.close() or {}
+		} else {
+			conn.write_string(head_request) or {
+				conn.close() or {}
+				continue
+			}
+			mut buf := []u8{len: 1024}
+			n := conn.read(mut buf) or {
+				println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
+				state.report_failure(site)
+				conn.close() or {}
+				continue
+			}
+			if n > 0 {
+				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
+			}
 			conn.close() or {}
-			continue
-		}
-		
-		mut buf :=[]u8{len: 1024}
-		n := conn.read(mut buf) or {
-			println('[Worker $worker_id][!] Timeout/Blocked: $url')
-			conn.close() or {}
-			continue
 		}
 
-		if n > 0 {
-			println('[Worker $worker_id] [✔] Obfuscated Visit: $url (Success)')
-		}
-
-		conn.close() or {}
-		time.sleep(10 * time.millisecond)
+		// Random dwell time: 2 to 7 seconds to look like a real user
+		dwell := rand.int_in_range(2, 8) or { 3 }
+		time.sleep(dwell * time.second)
 	}
 }
 
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('Envelop')
-	fp.version('1.3.0')
+	fp.version('1.4.1')
 	fp.description('Generates background HTTP HEAD requests to obfuscate real web traffic.')
 	fp.skip_executable()
 
@@ -122,7 +246,7 @@ fn main() {
 	count_arg := fp.int('count', `c`, 500, 'Total number of random requests to generate')
 
 	fp.finalize() or {
-		eprintln('[!] Error parsing arguments: $err')
+		eprintln('[!] Error parsing arguments: ${err}')
 		println(fp.usage())
 		exit(1)
 	}
@@ -135,39 +259,62 @@ fn main() {
 
 	println('[*] Starting Envelope Session...')
 
-	mut raw_content := ''
-	if list_arg.starts_with('http://') || list_arg.starts_with('https://') {
-		println('[*] Downloading site list from URL: $list_arg')
-		resp := http.get(list_arg) or {
-			eprintln('[!] Error downloading site list: $err')
-			exit(1)
-		}
-		raw_content = resp.body
-	} else {
-		println('[*] Reading local site list: $list_arg')
-		raw_content = os.read_file(list_arg) or {
-			eprintln('[!] Error reading local site file: $err')
-			exit(1)
-		}
-	}
+	mut active_sites := []string{}
+	md5_hash := md5.hexhash(list_arg)
+	active_path := 'active_${md5_hash}.txt'
 
-	mut sites :=[]string{}
-	for line in raw_content.split_into_lines() {
-		trimmed := line.trim_space()
-		if trimmed != '' {
-			mut url := trimmed
-			if !url.starts_with('http://') && !url.starts_with('https://') {
-				url = 'http://' + url
+	if os.exists(active_path) {
+		println('[*] Found active list, loading: ${active_path}')
+		active_content := os.read_file(active_path) or { '' }
+		for line in active_content.split_into_lines() {
+			trimmed := line.trim_space()
+			if trimmed != '' {
+				active_sites << trimmed
 			}
-			sites << url
 		}
 	}
 
-	if sites.len == 0 {
+	if active_sites.len == 0 {
+		println('[*] Active list not found or empty. Loading from source: ${list_arg}')
+		mut raw_content := ''
+		if list_arg.starts_with('http://') || list_arg.starts_with('https://') {
+			resp := http.get(list_arg) or {
+				eprintln('[!] Error downloading site list: ${err}')
+				exit(1)
+			}
+			raw_content = resp.body
+		} else {
+			raw_content = os.read_file(list_arg) or {
+				eprintln('[!] Error reading local site file: ${err}')
+				exit(1)
+			}
+		}
+
+		for line in raw_content.split_into_lines() {
+			trimmed := line.trim_space()
+			if trimmed != '' {
+				active_sites << trimmed
+			}
+		}
+
+		if active_sites.len > 0 {
+			mut f := os.create(active_path) or {
+				eprintln('[!] Could not create active list file: ${err}')
+				exit(1)
+			}
+			for s in active_sites {
+				f.writeln(s) or { break }
+			}
+			f.close()
+			println('[*] Created active list: ${active_path}')
+		}
+	}
+
+	if active_sites.len == 0 {
 		eprintln('[!] Error: The site list is empty.')
 		exit(1)
 	}
-	println('[*] Successfully loaded ${sites.len} sites.')
+	println('[*] Successfully loaded ${active_sites.len} sites.')
 
 	mut user_agents := default_user_agents.clone()
 	if ua_arg != '' {
@@ -187,7 +334,7 @@ fn main() {
 			}
 		}
 
-		mut loaded_uas :=[]string{}
+		mut loaded_uas := []string{}
 		for line in raw_ua_content.split_into_lines() {
 			trimmed := line.trim_space()
 			if trimmed != '' {
@@ -204,9 +351,15 @@ fn main() {
 	}
 
 	if proxy_arg != '' {
-		println('[*] Configuration: $workers_arg workers | $timeout_arg sec timeout | $count_arg total requests | Proxy: $proxy_arg\n')
+		println('[*] Configuration: ${workers_arg} workers | ${timeout_arg} sec timeout | ${count_arg} total requests | Proxy: ${proxy_arg}\n')
 	} else {
-		println('[*] Configuration: $workers_arg workers | $timeout_arg sec timeout | $count_arg total requests\n')
+		println('[*] Configuration: ${workers_arg} workers | ${timeout_arg} sec timeout | ${count_arg} total requests\n')
+	}
+
+	shared state := AppState{
+		sites: active_sites
+		active_path: active_path
+		failure_counts: map[string]int{}
 	}
 
 	mut wg := sync.new_waitgroup()
@@ -215,12 +368,28 @@ fn main() {
 	mut jobs := chan string{cap: 1000}
 
 	for i in 1 .. (workers_arg + 1) {
-		spawn worker(i, jobs, user_agents, mut wg, timeout_arg, redirect_arg, proxy_arg)
+		spawn worker(i, jobs, user_agents, mut wg, timeout_arg, redirect_arg, proxy_arg, shared
+			state)
 	}
 
 	for _ in 0 .. count_arg {
-		idx := rand.int_in_range(0, sites.len) or { 0 }
-		jobs <- sites[idx]
+		mut url := ''
+		mut related := ''
+		lock state {
+			if state.sites.len > 0 {
+				idx := rand.int_in_range(0, state.sites.len) or { 0 }
+				url = state.sites[idx]
+				if rand.f64() < 0.3 {
+					related = find_related_internal(url, state.sites)
+				}
+			}
+		}
+		if url != '' {
+			jobs <- url
+		}
+		if related != '' {
+			jobs <- related
+		}
 	}
 
 	jobs.close()
