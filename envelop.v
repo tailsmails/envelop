@@ -37,6 +37,7 @@ mut:
 	sites          []string
 	active_path    string
 	failure_counts map[string]int
+	focus_mode     bool
 }
 
 fn (shared s AppState) report_failure(url string) {
@@ -225,7 +226,20 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 		}
 
 		// Random dwell time: 2 to 7 seconds to look like a real user
-		dwell := rand.int_in_range(2, 8) or { 3 }
+		// In focus mode, we stay longer (15 to 45 seconds)
+		mut dwell_min := 2
+		mut dwell_max := 8
+		lock state {
+			if state.focus_mode {
+				dwell_min = 15
+				dwell_max = 45
+			}
+		}
+
+		dwell := rand.int_in_range(dwell_min, dwell_max) or { dwell_min }
+		if dwell > 10 {
+			println('[Worker ${worker_id}] [*] Focus Mode: Staying on ${host} for ${dwell} seconds...')
+		}
 		time.sleep(dwell * time.second)
 	}
 }
@@ -244,6 +258,7 @@ fn main() {
 	workers_arg := fp.int('workers', `w`, 10, 'Number of concurrent workers (threads)')
 	redirect_arg := fp.int('redirect', `r`, 0, 'If you want to enable redirect (0 for false/any for true)')
 	count_arg := fp.int('count', `c`, 500, 'Total number of random requests to generate')
+	focus_arg := fp.bool('focus', `f`, false, 'Enable focus mode (simulates longer site visits)')
 
 	fp.finalize() or {
 		eprintln('[!] Error parsing arguments: ${err}')
@@ -350,16 +365,20 @@ fn main() {
 		}
 	}
 
-	if proxy_arg != '' {
-		println('[*] Configuration: ${workers_arg} workers | ${timeout_arg} sec timeout | ${count_arg} total requests | Proxy: ${proxy_arg}\n')
-	} else {
-		println('[*] Configuration: ${workers_arg} workers | ${timeout_arg} sec timeout | ${count_arg} total requests\n')
+	mut config_msg := '[*] Configuration: ${workers_arg} workers | ${timeout_arg} sec timeout | ${count_arg} total requests'
+	if focus_arg {
+		config_msg += ' | Focus Mode: Enabled'
 	}
+	if proxy_arg != '' {
+		config_msg += ' | Proxy: ${proxy_arg}'
+	}
+	println(config_msg + '\n')
 
 	shared state := AppState{
 		sites: active_sites
 		active_path: active_path
 		failure_counts: map[string]int{}
+		focus_mode: focus_arg
 	}
 
 	mut wg := sync.new_waitgroup()
@@ -374,21 +393,35 @@ fn main() {
 
 	for _ in 0 .. count_arg {
 		mut url := ''
-		mut related := ''
+		mut related := []string{}
 		lock state {
 			if state.sites.len > 0 {
 				idx := rand.int_in_range(0, state.sites.len) or { 0 }
 				url = state.sites[idx]
-				if rand.f64() < 0.3 {
-					related = find_related_internal(url, state.sites)
+
+				related_chance := if state.focus_mode { 0.7 } else { 0.3 }
+				related_max := if state.focus_mode { 5 } else { 1 }
+
+				if rand.f64() < related_chance {
+					num_related := if state.focus_mode {
+						rand.int_in_range(1, related_max + 1) or { 1 }
+					} else {
+						1
+					}
+					for _ in 0 .. num_related {
+						r := find_related_internal(url, state.sites)
+						if r != '' {
+							related << r
+						}
+					}
 				}
 			}
 		}
 		if url != '' {
 			jobs <- url
 		}
-		if related != '' {
-			jobs <- related
+		for r in related {
+			jobs <- r
 		}
 	}
 
