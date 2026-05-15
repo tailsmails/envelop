@@ -143,7 +143,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 
 		mut url_str := site
 		if !url_str.contains('://') {
-			url_str = 'https://' + url_str
+			url_str = 'http://' + url_str
 		}
 
 		u := urllib.parse(url_str) or {
