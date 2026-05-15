@@ -8,6 +8,7 @@ Envelop is a lightweight, concurrent web traffic obfuscation tool written in the
 * **Flexible Input Sources:** Load your target website lists and custom User-Agent lists from either local text files or remote URLs.
 * **Low Overhead:** Uses raw TCP sockets to send minimalistic `HEAD` requests, ensuring minimal bandwidth usage and faster execution compared to standard HTTP GET requests.
 * **Highly Customizable:** Offers command-line flags to easily adjust the number of concurrent workers, connection timeouts, and the total volume of requests generated.
+* **Focus Mode:** Simulates a real user focusing on a specific site by staying longer and visiting more related internal pages.
 * **Automatic Fallbacks:** Includes a built-in list of common, up-to-date User-Agents in case a custom list is not provided or fails to load.
 
 ## Prerequisites
@@ -48,6 +49,7 @@ You can run the compiled executable directly from your terminal. The only strict
 * `-w`, `--workers` *(Optional)*: Number of concurrent workers (threads) to spawn. Default is `10`.
 * `-r`, `--redirect` *(Optional)*: Pass `0` to disable redirects, or any other integer to enable them. Default is `0`.
 * `-c`, `--count` *(Optional)*: Total number of random requests to generate across all workers before exiting. Default is `500`.
+* `-f`, `--focus` *(Optional)*: Enable focus mode. This simulates longer visits (15-45 seconds) and increases the frequency of related site visits.
 
 ## Examples
 
