@@ -74,6 +74,9 @@ fn get_base_domain(hostname string) string {
 }
 
 fn find_related_internal(url string, sites []string) string {
+	if sites.len == 0 {
+		return ''
+	}
 	mut u_str := url
 	if !u_str.contains('://') {
 		u_str = 'https://' + u_str
@@ -82,26 +85,19 @@ fn find_related_internal(url string, sites []string) string {
 	host := u.hostname()
 	base := get_base_domain(host)
 
-	mut related_pool := []string{}
-	for site in sites {
+	// Optimization: search up to 500 random sites to find a related one.
+	// This avoids O(N^2) complexity with huge site lists.
+	attempts := if sites.len < 500 { sites.len } else { 500 }
+	for _ in 0 .. attempts {
+		idx := rand.int_in_range(0, sites.len) or { 0 }
+		site := sites[idx]
 		if site == url {
 			continue
 		}
-		mut su_str := site
-		if !su_str.contains('://') {
-			su_str = 'https://' + su_str
+		if site.contains(base) {
+			println('[*] Simulating session: Found related domain ${site} for ${url}')
+			return site
 		}
-		su := urllib.parse(su_str) or { continue }
-		shost := su.hostname()
-		if shost.ends_with(base) {
-			related_pool << site
-		}
-	}
-
-	if related_pool.len > 0 {
-		ridx := rand.int_in_range(0, related_pool.len) or { 0 }
-		println('[*] Simulating session: Found related domain ${related_pool[ridx]} for ${url}')
-		return related_pool[ridx]
 	}
 	return ''
 }
@@ -178,7 +174,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 		ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
 		random_ua := ua_list[ua_idx]
 		path := if u.path == '' { '/' } else { u.path }
-		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: close\r\n\r\n'
+		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nAccept: */*\r\nConnection: close\r\n\r\n'
 
 		if is_https {
 			mut s := ssl.new_ssl_conn() or {
@@ -203,7 +199,9 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 				s.close() or {}
 				continue
 			}
-			println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success, ${n} bytes)')
+			if n >= 0 {
+				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success, ${n} bytes)')
+			}
 			s.close() or {}
 		} else {
 			conn.write_string(head_request) or {
@@ -217,7 +215,9 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 				conn.close() or {}
 				continue
 			}
-			println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success, ${n} bytes)')
+			if n >= 0 {
+				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success, ${n} bytes)')
+			}
 			conn.close() or {}
 		}
 
@@ -243,7 +243,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('Envelop')
-	fp.version('1.4.1')
+	fp.version('1.5.0')
 	fp.description('Generates background HTTP HEAD requests to obfuscate real web traffic.')
 	fp.skip_executable()
 
@@ -252,7 +252,7 @@ fn main() {
 	proxy_arg := fp.string('proxy', `p`, '', 'SOCKS5 proxy address (e.g. 127.0.0.1:9050) [Optional]')
 	timeout_arg := fp.int('timeout', `t`, 5, 'Timeout for HTTP requests in seconds')
 	workers_arg := fp.int('workers', `w`, 10, 'Number of concurrent workers (threads)')
-	redirect_arg := fp.int('redirect', `r`, 0, 'If you want to enable redirect (0 for false/any for true)')
+	_ := fp.int('redirect', `r`, 0, 'Legacy redirect flag')
 	count_arg := fp.int('count', `c`, 500, 'Total number of random requests to generate')
 	focus_arg := fp.bool('focus', `f`, false, 'Enable focus mode (simulates longer site visits)')
 
@@ -396,15 +396,10 @@ fn main() {
 				url = state.sites[idx]
 
 				related_chance := if state.focus_mode { 0.7 } else { 0.3 }
-				related_max := if state.focus_mode { 5 } else { 1 }
+				related_max := if state.focus_mode { 2 } else { 1 }
 
 				if rand.f64() < related_chance {
-					num_related := if state.focus_mode {
-						rand.int_in_range(1, related_max + 1) or { 1 }
-					} else {
-						1
-					}
-					for _ in 0 .. num_related {
+					for _ in 0 .. related_max {
 						r := find_related_internal(url, state.sites)
 						if r != '' {
 							related << r
