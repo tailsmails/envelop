@@ -203,9 +203,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 				s.close() or {}
 				continue
 			}
-			if n > 0 {
-				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
-			}
+			println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success, ${n} bytes)')
 			s.close() or {}
 		} else {
 			conn.write_string(head_request) or {
@@ -219,9 +217,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 				conn.close() or {}
 				continue
 			}
-			if n > 0 {
-				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
-			}
+			println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success, ${n} bytes)')
 			conn.close() or {}
 		}
 
@@ -335,16 +331,16 @@ fn main() {
 	if ua_arg != '' {
 		mut raw_ua_content := ''
 		if ua_arg.starts_with('http://') || ua_arg.starts_with('https://') {
-			println('[*] Downloading User-Agents list from URL: $ua_arg')
+			println('[*] Downloading User-Agents list from URL: ${ua_arg}')
 			resp_ua := http.get(ua_arg) or {
-				eprintln('[!] Error downloading User-Agents: $err')
+				eprintln('[!] Error downloading User-Agents: ${err}')
 				exit(1)
 			}
 			raw_ua_content = resp_ua.body
 		} else {
-			println('[*] Reading local User-Agents list: $ua_arg')
+			println('[*] Reading local User-Agents list: ${ua_arg}')
 			raw_ua_content = os.read_file(ua_arg) or {
-				eprintln('[!] Error reading local User-Agents file: $err')
+				eprintln('[!] Error reading local User-Agents file: ${err}')
 				exit(1)
 			}
 		}
