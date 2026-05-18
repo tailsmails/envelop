@@ -38,6 +38,7 @@ mut:
 	active_path    string
 	failure_counts map[string]int
 	focus_mode     bool
+	insecure       bool
 }
 
 fn (shared s AppState) report_failure(url string) {
@@ -143,7 +144,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 
 		mut url_str := site
 		if !url_str.contains('://') {
-			url_str = 'http://' + url_str
+			url_str = 'https://' + url_str
 		}
 
 		u := urllib.parse(url_str) or {
@@ -181,7 +182,32 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: close\r\n\r\n'
 
 		if is_https {
-			mut s := ssl.new_ssl_conn() or {
+			mut validate := true
+			lock state {
+				if state.insecure {
+					validate = false
+				}
+			}
+			// Attempt to use system default CA certificates if none provided and validation is enabled
+			mut verify := ''
+			if validate {
+				// Common paths for CA certificates on Linux
+				ca_paths := [
+					'/etc/ssl/certs/ca-certificates.crt',
+					'/etc/pki/tls/certs/ca-bundle.crt',
+					'/etc/ssl/ca-bundle.pem',
+					'/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem',
+					'/etc/ssl/cert.pem',
+				]
+				for p in ca_paths {
+					if os.exists(p) {
+						verify = p
+						break
+					}
+				}
+			}
+
+			mut s := ssl.new_ssl_conn(validate: validate, verify: verify) or {
 				println('[Worker ${worker_id}] [!] SSL Initialization Failed: ${err}')
 				conn.close() or {}
 				continue
@@ -259,6 +285,7 @@ fn main() {
 	redirect_arg := fp.int('redirect', `r`, 0, 'If you want to enable redirect (0 for false/any for true)')
 	count_arg := fp.int('count', `c`, 500, 'Total number of random requests to generate')
 	focus_arg := fp.bool('focus', `f`, false, 'Enable focus mode (simulates longer site visits)')
+	insecure_arg := fp.bool('insecure', `k`, false, 'Allow insecure SSL connections (disables certificate validation)')
 
 	fp.finalize() or {
 		eprintln('[!] Error parsing arguments: ${err}')
@@ -379,6 +406,7 @@ fn main() {
 		active_path: active_path
 		failure_counts: map[string]int{}
 		focus_mode: focus_arg
+		insecure: insecure_arg
 	}
 
 	mut wg := sync.new_waitgroup()
