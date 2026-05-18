@@ -18,7 +18,6 @@ import flag
 import net.http
 import net.urllib
 import net
-import net.ssl
 import sync
 import rand
 import time
@@ -38,7 +37,6 @@ mut:
 	active_path    string
 	failure_counts map[string]int
 	focus_mode     bool
-	insecure       bool
 }
 
 fn (shared s AppState) report_failure(url string) {
@@ -77,7 +75,7 @@ fn get_base_domain(hostname string) string {
 fn find_related_internal(url string, sites []string) string {
 	mut u_str := url
 	if !u_str.contains('://') {
-		u_str = 'https://' + u_str
+		u_str = 'http://' + u_str
 	}
 	u := urllib.parse(u_str) or { return '' }
 	host := u.hostname()
@@ -90,7 +88,7 @@ fn find_related_internal(url string, sites []string) string {
 		}
 		mut su_str := site
 		if !su_str.contains('://') {
-			su_str = 'https://' + su_str
+			su_str = 'http://' + su_str
 		}
 		su := urllib.parse(su_str) or { continue }
 		shost := su.hostname()
@@ -144,7 +142,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 
 		mut url_str := site
 		if !url_str.contains('://') {
-			url_str = 'https://' + url_str
+			url_str = 'http://' + url_str
 		}
 
 		u := urllib.parse(url_str) or {
@@ -152,11 +150,10 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 			continue
 		}
 
-		is_https := u.scheme == 'https'
 		host := u.hostname()
 		mut port := u.port().int()
 		if port == 0 {
-			port = if is_https { 443 } else { 80 }
+			port = if u.scheme == 'https' { 443 } else { 80 }
 		}
 
 		mut conn := if proxy_addr != '' {
@@ -179,107 +176,23 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 		ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
 		random_ua := ua_list[ua_idx]
 		path := if u.path == '' { '/' } else { u.path }
-		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: keep-alive\r\n\r\n'
+		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: close\r\n\r\n'
 
-		if is_https {
-			mut validate := true
-			lock state {
-				if state.insecure {
-					validate = false
-				}
-			}
-			// Attempt to use system default CA certificates if none provided and validation is enabled
-			mut verify := ''
-			if validate {
-				// Common paths for CA certificates on Linux
-				ca_paths := [
-					'/etc/ssl/certs/ca-certificates.crt',
-					'/etc/pki/tls/certs/ca-bundle.crt',
-					'/etc/ssl/ca-bundle.pem',
-					'/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem',
-					'/etc/ssl/cert.pem',
-				]
-				for p in ca_paths {
-					if os.exists(p) {
-						verify = p
-						break
-					}
-				}
-			}
-
-			mut s := ssl.new_ssl_conn(validate: validate, verify: verify) or {
-				println('[Worker ${worker_id}] [!] SSL Initialization Failed: ${err}')
-				conn.close() or {}
-				continue
-			}
-
-			// In case of mbedtls, we can force NONE mode if insecure is requested.
-			// This bypasses a limitation in V's net.ssl where 'validate: false'
-			// translates to MBEDTLS_SSL_VERIFY_OPTIONAL which still performs some checks.
-			$if !d_use_openssl ? {
-				if !validate {
-					unsafe {
-						// MBEDTLS_SSL_VERIFY_NONE is 0
-						C.mbedtls_ssl_conf_authmode(&s.conf, 0)
-					}
-				}
-			}
-
-			mut connected := false
-			// Retry loop to handle transient SSL handshake errors (like WANT_READ/WANT_WRITE)
-			// which are common under high concurrency or specific server configurations.
-			for _ in 0 .. 3 {
-				s.connect(mut conn, host) or {
-					// -26880 is MBEDTLS_ERR_SSL_WANT_READ
-					if err.code() == -26880 || err.msg().contains('WANT_READ')
-						|| err.msg().contains('WANT_WRITE') {
-						time.sleep(100 * time.millisecond)
-						continue
-					}
-					println('[Worker ${worker_id}] [!] SSL Handshake Failed for ${url_str}: ${err}')
-					break
-				}
-				connected = true
-				break
-			}
-
-			if !connected {
-				state.report_failure(site)
-				conn.close() or {}
-				continue
-			}
-			s.write_string(head_request) or {
-				s.close() or {}
-				continue
-			}
-			mut buf := []u8{len: 1024}
-			n := s.read(mut buf) or {
-				println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
-				state.report_failure(site)
-				s.close() or {}
-				continue
-			}
-			if n > 0 {
-				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
-			}
-			s.close() or {}
-		} else {
-			conn.write_string(head_request) or {
-				conn.close() or {}
-				continue
-			}
-			mut buf := []u8{len: 1024}
-			n := conn.read(mut buf) or {
-				println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
-				state.report_failure(site)
-				conn.close() or {}
-				continue
-			}
-			if n > 0 {
-				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
-			}
+		conn.write_string(head_request) or {
 			conn.close() or {}
+			continue
 		}
+		mut buf := []u8{len: 1024}
+		n := conn.read(mut buf) or {
+			println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
+			state.report_failure(site)
+			conn.close() or {}
+			continue
+		}
+		if n > 0 {
+			println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
+		}
+		conn.close() or {}
 
 		// Random dwell time: 2 to 7 seconds to look like a real user
 		// In focus mode, we stay longer (15 to 45 seconds)
@@ -315,7 +228,6 @@ fn main() {
 	redirect_arg := fp.int('redirect', `r`, 0, 'If you want to enable redirect (0 for false/any for true)')
 	count_arg := fp.int('count', `c`, 500, 'Total number of random requests to generate')
 	focus_arg := fp.bool('focus', `f`, false, 'Enable focus mode (simulates longer site visits)')
-	insecure_arg := fp.bool('insecure', `k`, false, 'Allow insecure SSL connections (disables certificate validation)')
 
 	fp.finalize() or {
 		eprintln('[!] Error parsing arguments: ${err}')
@@ -436,11 +348,6 @@ fn main() {
 		active_path: active_path
 		failure_counts: map[string]int{}
 		focus_mode: focus_arg
-		insecure: insecure_arg
-	}
-
-	if insecure_arg {
-		println('[!] Warning: Insecure mode enabled. SSL certificate validation is disabled.')
 	}
 
 	mut wg := sync.new_waitgroup()
