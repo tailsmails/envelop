@@ -212,6 +212,18 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 				conn.close() or {}
 				continue
 			}
+
+			// In case of mbedtls, we can force NONE mode if insecure is requested.
+			// This bypasses a limitation in V's net.ssl where 'validate: false'
+			// translates to MBEDTLS_SSL_VERIFY_OPTIONAL which still performs some checks.
+			$if !d_use_openssl ? {
+				if !validate {
+					unsafe {
+						C.mbedtls_ssl_conf_authmode(&s.conf, 0)
+					}
+				}
+			}
+
 			s.connect(mut conn, host) or {
 				println('[Worker ${worker_id}] [!] SSL Handshake Failed for ${url_str}: ${err}')
 				state.report_failure(site)
@@ -407,6 +419,10 @@ fn main() {
 		failure_counts: map[string]int{}
 		focus_mode: focus_arg
 		insecure: insecure_arg
+	}
+
+	if insecure_arg {
+		println('[!] Warning: Insecure mode enabled. SSL certificate validation is disabled.')
 	}
 
 	mut wg := sync.new_waitgroup()
