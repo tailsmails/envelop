@@ -179,7 +179,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 		ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
 		random_ua := ua_list[ua_idx]
 		path := if u.path == '' { '/' } else { u.path }
-		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: close\r\n\r\n'
+		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: keep-alive\r\n\r\n'
 
 		if is_https {
 			mut validate := true
@@ -219,13 +219,31 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 			$if !d_use_openssl ? {
 				if !validate {
 					unsafe {
+						// MBEDTLS_SSL_VERIFY_NONE is 0
 						C.mbedtls_ssl_conf_authmode(&s.conf, 0)
 					}
 				}
 			}
 
-			s.connect(mut conn, host) or {
-				println('[Worker ${worker_id}] [!] SSL Handshake Failed for ${url_str}: ${err}')
+			mut connected := false
+			// Retry loop to handle transient SSL handshake errors (like WANT_READ/WANT_WRITE)
+			// which are common under high concurrency or specific server configurations.
+			for _ in 0 .. 3 {
+				s.connect(mut conn, host) or {
+					// -26880 is MBEDTLS_ERR_SSL_WANT_READ
+					if err.code() == -26880 || err.msg().contains('WANT_READ')
+						|| err.msg().contains('WANT_WRITE') {
+						time.sleep(100 * time.millisecond)
+						continue
+					}
+					println('[Worker ${worker_id}] [!] SSL Handshake Failed for ${url_str}: ${err}')
+					break
+				}
+				connected = true
+				break
+			}
+
+			if !connected {
 				state.report_failure(site)
 				conn.close() or {}
 				continue
