@@ -18,7 +18,6 @@ import flag
 import net.http
 import net.urllib
 import net
-import net.ssl
 import sync
 import rand
 import time
@@ -53,7 +52,6 @@ fn (shared s AppState) report_failure(url string) {
 			}
 			if idx != -1 {
 				s.sites.delete(idx)
-				// Update the active list file
 				mut f := os.create(s.active_path) or { return }
 				for site in s.sites {
 					f.writeln(site) or { break }
@@ -143,7 +141,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 
 		mut url_str := site
 		if !url_str.contains('://') {
-			url_str = 'http://' + url_str
+			url_str = 'https://' + url_str
 		}
 
 		u := urllib.parse(url_str) or {
@@ -151,11 +149,10 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 			continue
 		}
 
-		is_https := u.scheme == 'https'
 		host := u.hostname()
 		mut port := u.port().int()
 		if port == 0 {
-			port = if is_https { 443 } else { 80 }
+			port = if u.scheme == 'https' { 443 } else { 80 }
 		}
 
 		mut conn := if proxy_addr != '' {
@@ -180,53 +177,22 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 		path := if u.path == '' { '/' } else { u.path }
 		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: close\r\n\r\n'
 
-		if is_https {
-			mut s := ssl.new_ssl_conn() or {
-				println('[Worker ${worker_id}] [!] SSL Initialization Failed: ${err}')
-				conn.close() or {}
-				continue
-			}
-			s.connect(mut conn, host) or {
-				println('[Worker ${worker_id}] [!] SSL Handshake Failed for ${url_str}: ${err}')
-				state.report_failure(site)
-				conn.close() or {}
-				continue
-			}
-			s.write_string(head_request) or {
-				s.close() or {}
-				continue
-			}
-			mut buf := []u8{len: 1024}
-			n := s.read(mut buf) or {
-				println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
-				state.report_failure(site)
-				s.close() or {}
-				continue
-			}
-			if n > 0 {
-				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
-			}
-			s.close() or {}
-		} else {
-			conn.write_string(head_request) or {
-				conn.close() or {}
-				continue
-			}
-			mut buf := []u8{len: 1024}
-			n := conn.read(mut buf) or {
-				println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
-				state.report_failure(site)
-				conn.close() or {}
-				continue
-			}
-			if n > 0 {
-				println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
-			}
+		conn.write_string(head_request) or {
 			conn.close() or {}
+			continue
 		}
-
-		// Random dwell time: 2 to 7 seconds to look like a real user
-		// In focus mode, we stay longer (15 to 45 seconds)
+		mut buf := []u8{len: 1024}
+		n := conn.read(mut buf) or {
+			println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
+			state.report_failure(site)
+			conn.close() or {}
+			continue
+		}
+		if n > 0 {
+			println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
+		}
+		conn.close() or {}
+		
 		mut dwell_min := 2
 		mut dwell_max := 8
 		lock state {
@@ -292,7 +258,7 @@ fn main() {
 	if active_sites.len == 0 {
 		println('[*] Active list not found or empty. Loading from source: ${list_arg}')
 		mut raw_content := ''
-		if list_arg.starts_with('http://') || list_arg.starts_with('https://') {
+		if list_arg.starts_with('https://') || list_arg.starts_with('https://') {
 			resp := http.get(list_arg) or {
 				eprintln('[!] Error downloading site list: ${err}')
 				exit(1)
@@ -334,7 +300,7 @@ fn main() {
 	mut user_agents := default_user_agents.clone()
 	if ua_arg != '' {
 		mut raw_ua_content := ''
-		if ua_arg.starts_with('http://') || ua_arg.starts_with('https://') {
+		if ua_arg.starts_with('https://') || ua_arg.starts_with('https://') {
 			println('[*] Downloading User-Agents list from URL: $ua_arg')
 			resp_ua := http.get(ua_arg) or {
 				eprintln('[!] Error downloading User-Agents: $err')
