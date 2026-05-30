@@ -18,6 +18,7 @@ import flag
 import net.http
 import net.urllib
 import net
+import net.ssl
 import sync
 import rand
 import time
@@ -31,35 +32,40 @@ const default_user_agents = [
 	'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
 ]
 
-struct AppState {
+struct App {
 mut:
 	sites          []string
 	active_path    string
 	failure_counts map[string]int
 	focus_mode     bool
+	user_agents    []string
+	timeout        int
+	proxy_addr     string
 }
 
-fn (shared s AppState) report_failure(url string) {
-	lock s {
-		s.failure_counts[url]++
-		if s.failure_counts[url] >= 3 {
-			mut idx := -1
-			for i, s_url in s.sites {
-				if s_url == url {
-					idx = i
-					break
-				}
-			}
+fn (shared app App) report_failure(url string) {
+	lock app {
+		app.failure_counts[url]++
+		if app.failure_counts[url] >= 3 {
+			idx := app.sites.index(url)
 			if idx != -1 {
-				s.sites.delete(idx)
-				mut f := os.create(s.active_path) or { return }
-				for site in s.sites {
-					f.writeln(site) or { break }
+				app.sites.delete(idx)
+				app.save_active_list() or {
+					eprintln('[!] Failed to update active list file: ${err}')
 				}
-				f.close()
-				println('[*] [!] Site ${url} removed from active list due to repeated failures.')
+				eprintln('[*] [!] Site ${url} removed from active list due to repeated failures.')
 			}
 		}
+	}
+}
+
+fn (app &App) save_active_list() ! {
+	mut f := os.create(app.active_path)!
+	defer {
+		f.close()
+	}
+	for site in app.sites {
+		f.writeln(site)!
 	}
 }
 
@@ -68,10 +74,10 @@ fn get_base_domain(hostname string) string {
 	if parts.len <= 2 {
 		return hostname
 	}
-	return parts[parts.len - 2] + '.' + parts[parts.len - 1]
+	return parts[parts.len - 2..].join('.')
 }
 
-fn find_related_internal(url string, sites []string) string {
+fn (app &App) find_related_internal(url string) string {
 	mut u_str := url
 	if !u_str.contains('://') {
 		u_str = 'https://' + u_str
@@ -81,7 +87,7 @@ fn find_related_internal(url string, sites []string) string {
 	base := get_base_domain(host)
 
 	mut related_pool := []string{}
-	for site in sites {
+	for site in app.sites {
 		if site == url {
 			continue
 		}
@@ -98,7 +104,6 @@ fn find_related_internal(url string, sites []string) string {
 
 	if related_pool.len > 0 {
 		ridx := rand.int_in_range(0, related_pool.len) or { 0 }
-		println('[*] Simulating session: Found related domain ${related_pool[ridx]} for ${url}')
 		return related_pool[ridx]
 	}
 	return ''
@@ -131,7 +136,7 @@ fn dial_proxy(proxy_addr string, host string, port int) !&net.TcpConn {
 	return c
 }
 
-fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGroup, timeout_sec int, redirect int, proxy_addr string, shared state AppState) {
+fn worker(worker_id int, jobs chan string, mut wg sync.WaitGroup, shared app App) {
 	defer {
 		wg.done()
 	}
@@ -145,7 +150,7 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 		}
 
 		u := urllib.parse(url_str) or {
-			println('[Worker ${worker_id}] [!] Invalid URL: ${url_str}')
+			eprintln('[Worker ${worker_id}] [!] Invalid URL: ${url_str}')
 			continue
 		}
 
@@ -155,59 +160,112 @@ fn worker(worker_id int, jobs chan string, ua_list []string, mut wg sync.WaitGro
 			port = if u.scheme == 'https' { 443 } else { 80 }
 		}
 
-		mut conn := if proxy_addr != '' {
-			dial_proxy(proxy_addr, host, port) or {
-				println('[Worker ${worker_id}] [!] Proxy Connection Failed for ${url_str}: ${err}')
-				state.report_failure(site)
+		mut conn := if rlock app {
+			app.proxy_addr
+		} != '' {
+			dial_proxy(rlock app {
+				app.proxy_addr
+			}, host, port) or {
+				eprintln('[Worker ${worker_id}] [!] Proxy Connection Failed for ${url_str}: ${err}')
+				app.report_failure(site)
 				continue
 			}
 		} else {
 			net.dial_tcp('${host}:${port}') or {
-				println('[Worker ${worker_id}] [!] Connection Failed: ${url_str} (${err})')
-				state.report_failure(site)
+				eprintln('[Worker ${worker_id}] [!] Connection Failed: ${url_str} (${err})')
+				app.report_failure(site)
 				continue
 			}
 		}
 
-		conn.set_read_timeout(timeout_sec * time.second)
-		conn.set_write_timeout(timeout_sec * time.second)
-
-		ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
-		random_ua := ua_list[ua_idx]
-		path := if u.path == '' { '/' } else { u.path }
-		head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: close\r\n\r\n'
-
-		conn.write_string(head_request) or {
-			conn.close() or {}
-			continue
+		timeout := rlock app {
+			app.timeout
 		}
-		mut buf := []u8{len: 1024}
-		n := conn.read(mut buf) or {
-			println('[Worker ${worker_id}] [!] Read Timeout/Error: ${url_str}')
-			state.report_failure(site)
-			conn.close() or {}
-			continue
-		}
-		if n > 0 {
-			println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${url_str} (Success)')
+		conn.set_read_timeout(timeout * time.second)
+		conn.set_write_timeout(timeout * time.second)
+
+		if u.scheme == 'https' {
+			mut ssl_conn := ssl.new_ssl_conn() or {
+				eprintln('[Worker ${worker_id}] [!] SSL Connection Failed: ${err}')
+				conn.close() or {}
+				continue
+			}
+			ssl_conn.set_read_timeout(timeout * time.second)
+			ssl_conn.connect(mut *conn, host) or {
+				eprintln('[Worker ${worker_id}] [!] SSL Handshake Failed for ${host}: ${err}')
+				conn.close() or {}
+				continue
+			}
+
+			perform_head_request(worker_id, mut ssl_conn, u, rlock app {
+				app.user_agents
+			}) or {
+				eprintln('[Worker ${worker_id}] [!] Request Failed: ${url_str} (${err})')
+				app.report_failure(site)
+			}
+			ssl_conn.close() or {}
+		} else {
+			perform_head_request(worker_id, mut *conn, u, rlock app {
+				app.user_agents
+			}) or {
+				eprintln('[Worker ${worker_id}] [!] Request Failed: ${url_str} (${err})')
+				app.report_failure(site)
+			}
 		}
 		conn.close() or {}
-		
+
 		mut dwell_min := 2
 		mut dwell_max := 8
-		lock state {
-			if state.focus_mode {
-				dwell_min = 15
-				dwell_max = 45
-			}
+		if rlock app {
+			app.focus_mode
+		} {
+			dwell_min = 15
+			dwell_max = 45
 		}
 
 		dwell := rand.int_in_range(dwell_min, dwell_max) or { dwell_min }
-		if dwell > 10 {
-			println('[Worker ${worker_id}] [*] Focus Mode: Staying on ${host} for ${dwell} seconds...')
-		}
 		time.sleep(dwell * time.second)
 	}
+}
+
+interface Connection {
+mut:
+	write_string(s string) !int
+	read(mut buf []u8) !int
+}
+
+fn perform_head_request(worker_id int, mut conn Connection, u urllib.URL, ua_list []string) ! {
+	ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
+	random_ua := ua_list[ua_idx]
+	path := if u.path == '' { '/' } else { u.path }
+	host := u.hostname()
+	head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: close\r\n\r\n'
+
+	conn.write_string(head_request)!
+	mut buf := []u8{len: 1024}
+	n := conn.read(mut buf)!
+	if n > 0 {
+		println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${u} (Success)')
+	}
+}
+
+fn load_list(path_or_url string) ![]string {
+	mut raw_content := ''
+	if path_or_url.starts_with('http://') || path_or_url.starts_with('https://') {
+		resp := http.get(path_or_url)!
+		raw_content = resp.body
+	} else {
+		raw_content = os.read_file(path_or_url)!
+	}
+
+	mut sites := []string{}
+	for line in raw_content.split_into_lines() {
+		trimmed := line.trim_space()
+		if trimmed != '' {
+			sites << trimmed
+		}
+	}
+	return sites
 }
 
 fn main() {
@@ -219,10 +277,11 @@ fn main() {
 
 	list_arg := fp.string('list', `l`, '', 'Path or URL containing the site list [Required]')
 	ua_arg := fp.string('user-agents', `u`, '', 'Path or URL to custom User-Agents list [Optional]')
-	proxy_arg := fp.string('proxy', `p`, '', 'SOCKS5 proxy address (e.g. 127.0.0.1:9050) [Optional]')
+	proxy_arg := fp.string('proxy', `p`, '',
+		'SOCKS5 proxy address (e.g. 127.0.0.1:9050) [Optional]')
 	timeout_arg := fp.int('timeout', `t`, 5, 'Timeout for HTTP requests in seconds')
 	workers_arg := fp.int('workers', `w`, 10, 'Number of concurrent workers (threads)')
-	redirect_arg := fp.int('redirect', `r`, 0, 'If you want to enable redirect (0 for false/any for true)')
+	_ := fp.int('redirect', `r`, 0, 'If you want to enable redirect (ignored in current version)')
 	count_arg := fp.int('count', `c`, 500, 'Total number of random requests to generate')
 	focus_arg := fp.bool('focus', `f`, false, 'Enable focus mode (simulates longer site visits)')
 
@@ -246,36 +305,14 @@ fn main() {
 
 	if os.exists(active_path) {
 		println('[*] Found active list, loading: ${active_path}')
-		active_content := os.read_file(active_path) or { '' }
-		for line in active_content.split_into_lines() {
-			trimmed := line.trim_space()
-			if trimmed != '' {
-				active_sites << trimmed
-			}
-		}
+		active_sites = load_list(active_path) or { []string{} }
 	}
 
 	if active_sites.len == 0 {
 		println('[*] Active list not found or empty. Loading from source: ${list_arg}')
-		mut raw_content := ''
-		if list_arg.starts_with('https://') || list_arg.starts_with('https://') {
-			resp := http.get(list_arg) or {
-				eprintln('[!] Error downloading site list: ${err}')
-				exit(1)
-			}
-			raw_content = resp.body
-		} else {
-			raw_content = os.read_file(list_arg) or {
-				eprintln('[!] Error reading local site file: ${err}')
-				exit(1)
-			}
-		}
-
-		for line in raw_content.split_into_lines() {
-			trimmed := line.trim_space()
-			if trimmed != '' {
-				active_sites << trimmed
-			}
+		active_sites = load_list(list_arg) or {
+			eprintln('[!] Error loading site list: ${err}')
+			exit(1)
 		}
 
 		if active_sites.len > 0 {
@@ -299,28 +336,10 @@ fn main() {
 
 	mut user_agents := default_user_agents.clone()
 	if ua_arg != '' {
-		mut raw_ua_content := ''
-		if ua_arg.starts_with('https://') || ua_arg.starts_with('https://') {
-			println('[*] Downloading User-Agents list from URL: $ua_arg')
-			resp_ua := http.get(ua_arg) or {
-				eprintln('[!] Error downloading User-Agents: $err')
-				exit(1)
-			}
-			raw_ua_content = resp_ua.body
-		} else {
-			println('[*] Reading local User-Agents list: $ua_arg')
-			raw_ua_content = os.read_file(ua_arg) or {
-				eprintln('[!] Error reading local User-Agents file: $err')
-				exit(1)
-			}
-		}
-
-		mut loaded_uas := []string{}
-		for line in raw_ua_content.split_into_lines() {
-			trimmed := line.trim_space()
-			if trimmed != '' {
-				loaded_uas << trimmed
-			}
+		println('[*] Loading User-Agents list: ${ua_arg}')
+		mut loaded_uas := load_list(ua_arg) or {
+			eprintln('[!] Error loading User-Agents: ${err}')
+			exit(1)
 		}
 
 		if loaded_uas.len > 0 {
@@ -340,11 +359,14 @@ fn main() {
 	}
 	println(config_msg + '\n')
 
-	shared state := AppState{
-		sites: active_sites
-		active_path: active_path
+	shared app := App{
+		sites:          active_sites
+		active_path:    active_path
 		failure_counts: map[string]int{}
-		focus_mode: focus_arg
+		focus_mode:     focus_arg
+		user_agents:    user_agents
+		timeout:        timeout_arg
+		proxy_addr:     proxy_arg
 	}
 
 	mut wg := sync.new_waitgroup()
@@ -353,29 +375,28 @@ fn main() {
 	mut jobs := chan string{cap: 1000}
 
 	for i in 1 .. (workers_arg + 1) {
-		spawn worker(i, jobs, user_agents, mut wg, timeout_arg, redirect_arg, proxy_arg, shared
-			state)
+		spawn worker(i, jobs, mut wg, shared app)
 	}
 
 	for _ in 0 .. count_arg {
 		mut url := ''
 		mut related := []string{}
-		lock state {
-			if state.sites.len > 0 {
-				idx := rand.int_in_range(0, state.sites.len) or { 0 }
-				url = state.sites[idx]
+		lock app {
+			if app.sites.len > 0 {
+				idx := rand.int_in_range(0, app.sites.len) or { 0 }
+				url = app.sites[idx]
 
-				related_chance := if state.focus_mode { 0.7 } else { 0.3 }
-				related_max := if state.focus_mode { 5 } else { 1 }
+				related_chance := if app.focus_mode { 0.7 } else { 0.3 }
+				related_max := if app.focus_mode { 5 } else { 1 }
 
 				if rand.f64() < related_chance {
-					num_related := if state.focus_mode {
+					num_related := if app.focus_mode {
 						rand.int_in_range(1, related_max + 1) or { 1 }
 					} else {
 						1
 					}
 					for _ in 0 .. num_related {
-						r := find_related_internal(url, state.sites)
+						r := app.find_related_internal(url)
 						if r != '' {
 							related << r
 						}
