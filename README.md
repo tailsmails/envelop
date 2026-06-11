@@ -81,4 +81,4 @@ google.com
 https://github.com
 wikipedia.org
 ```
-*(Note: If the `http://` or `https://` protocol is missing, the tool will automatically prepend `http://`)*
+*(Note: If the `http://` or `https://` protocol is missing, the tool will automatically prepend `https://`)*
