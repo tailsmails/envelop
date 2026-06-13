@@ -196,8 +196,8 @@ fn worker(worker_id int, jobs chan string, mut wg sync.WaitGroup, shared app App
 				conn.close() or {}
 				continue
 			}
-
-			perform_head_request(worker_id, mut ssl_conn, u, rlock app {
+			
+			perform_get_request(worker_id, mut ssl_conn, u, rlock app {
 				app.user_agents
 			}) or {
 				eprintln('[Worker ${worker_id}] [!] Request Failed: ${url_str} (${err})')
@@ -205,7 +205,7 @@ fn worker(worker_id int, jobs chan string, mut wg sync.WaitGroup, shared app App
 			}
 			ssl_conn.close() or {}
 		} else {
-			perform_head_request(worker_id, mut *conn, u, rlock app {
+			perform_get_request(worker_id, mut *conn, u, rlock app {
 				app.user_agents
 			}) or {
 				eprintln('[Worker ${worker_id}] [!] Request Failed: ${url_str} (${err})')
@@ -234,18 +234,36 @@ mut:
 	read(mut buf []u8) !int
 }
 
-fn perform_head_request(worker_id int, mut conn Connection, u urllib.URL, ua_list []string) ! {
+fn perform_get_request(worker_id int, mut conn Connection, u urllib.URL, ua_list []string) ! {
 	ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
 	random_ua := ua_list[ua_idx]
 	path := if u.path == '' { '/' } else { u.path }
 	host := u.hostname()
-	head_request := 'HEAD ${path} HTTP/1.1\r\nHost: ${host}\r\nUser-Agent: ${random_ua}\r\nConnection: close\r\n\r\n'
+	
+	get_request := 'GET ${path} HTTP/1.1\r\n' +
+		'Host: ${host}\r\n' +
+		'User-Agent: ${random_ua}\r\n' +
+		'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n' +
+		'Accept-Language: en-US,en;q=0.5\r\n' +
+		'Upgrade-Insecure-Requests: 1\r\n' +
+		'Connection: close\r\n\r\n'
 
-	conn.write_string(head_request)!
-	mut buf := []u8{len: 1024}
-	n := conn.read(mut buf)!
-	if n > 0 {
-		println('[Worker ${worker_id}] [✔] Obfuscated Visit: ${u} (Success)')
+	conn.write_string(get_request)!
+	
+	mut buf := []u8{len: 4096}
+	mut total_read := 0
+	for {
+		n := conn.read(mut buf) or { break }
+		if n <= 0 { break }
+		total_read += n
+		
+		if total_read > 500 * 1024 {
+			break
+		}
+	}
+	
+	if total_read > 0 {
+		println('[Worker ${worker_id}] [✔] GET Visit: ${u} (Success, Read: ${total_read} bytes)')
 	}
 }
 
@@ -272,7 +290,7 @@ fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('Envelop')
 	fp.version('1.4.1')
-	fp.description('Generates background HTTP HEAD requests to obfuscate real web traffic.')
+	fp.description('Generates background HTTP GET requests to obfuscate real web traffic.')
 	fp.skip_executable()
 
 	list_arg := fp.string('list', `l`, '', 'Path or URL containing the site list [Required]')
@@ -297,7 +315,7 @@ fn main() {
 		exit(1)
 	}
 
-	println('[*] Starting Envelope Session...')
+	println('[*] Starting Envelope Session ...')
 
 	mut active_sites := []string{}
 	md5_hash := md5.hexhash(list_arg)
