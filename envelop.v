@@ -25,11 +25,11 @@ import time
 import crypto.md5
 
 const default_user_agents = [
-	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15',
-	'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/113.0',
-	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 Edg/114.0.1823.43',
-	'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
+	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+	'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+	'Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0',
+	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
+	'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
 ]
 
 struct App {
@@ -53,7 +53,7 @@ fn (shared app App) report_failure(url string) {
 				app.save_active_list() or {
 					eprintln('[!] Failed to update active list file: ${err}')
 				}
-				eprintln('[*] [!] Site ${url} removed from active list due to repeated failures.')
+				eprintln('[*] [!] Site ${url} removed from active list due to repeated network failures.')
 			}
 		}
 	}
@@ -159,7 +159,7 @@ fn worker(worker_id int, jobs chan string, mut wg sync.WaitGroup, shared app App
 		if port == 0 {
 			port = if u.scheme == 'https' { 443 } else { 80 }
 		}
-
+		
 		mut conn := if rlock app {
 			app.proxy_addr
 		} != '' {
@@ -186,7 +186,7 @@ fn worker(worker_id int, jobs chan string, mut wg sync.WaitGroup, shared app App
 
 		if u.scheme == 'https' {
 			mut ssl_conn := ssl.new_ssl_conn() or {
-				eprintln('[Worker ${worker_id}] [!] SSL Connection Failed: ${err}')
+				eprintln('[Worker ${worker_id}] [!] SSL Client Initialization Failed: ${err}')
 				conn.close() or {}
 				continue
 			}
@@ -201,7 +201,6 @@ fn worker(worker_id int, jobs chan string, mut wg sync.WaitGroup, shared app App
 				app.user_agents
 			}) or {
 				eprintln('[Worker ${worker_id}] [!] Request Failed: ${url_str} (${err})')
-				app.report_failure(site)
 			}
 			ssl_conn.close() or {}
 		} else {
@@ -209,7 +208,6 @@ fn worker(worker_id int, jobs chan string, mut wg sync.WaitGroup, shared app App
 				app.user_agents
 			}) or {
 				eprintln('[Worker ${worker_id}] [!] Request Failed: ${url_str} (${err})')
-				app.report_failure(site)
 			}
 		}
 		conn.close() or {}
@@ -234,19 +232,68 @@ mut:
 	read(mut buf []u8) !int
 }
 
+fn get_stealth_headers(ua string, host string) string {
+	mut headers := 'Host: ${host}\r\n' +
+		'User-Agent: ${ua}\r\n' +
+		'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n' +
+		'Accept-Language: en-US,en;q=0.9\r\n' +
+		'Upgrade-Insecure-Requests: 1\r\n' +
+		'Sec-Fetch-Mode: navigate\r\n' +
+		'Sec-Fetch-Dest: document\r\n' +
+		'Sec-Fetch-Site: none\r\n' +
+		'Sec-Fetch-User: ?1\r\n'
+		
+	referers := [
+		'https://www.google.com/',
+		'https://www.bing.com/',
+		'https://duckduckgo.com/',
+		'https://t.co/',
+		'https://news.ycombinator.com/'
+	]
+	ref_idx := rand.int_in_range(0, referers.len) or { 0 }
+	headers += 'Referer: ${referers[ref_idx]}\r\n'
+	
+	if ua.contains('Windows') {
+		headers += 'Sec-Ch-Ua-Platform: "Windows"\r\n'
+		if ua.contains('Edg') {
+			headers += 'Sec-Ch-Ua: "Not/A)Brand";v="99", "Microsoft Edge";v="124", "Chromium";v="124"\r\n'
+		} else {
+			headers += 'Sec-Ch-Ua: "Not/A)Brand";v="99", "Google Chrome";v="124", "Chromium";v="124"\r\n'
+		}
+		headers += 'Sec-Ch-Ua-Mobile: ?0\r\n'
+	} else if ua.contains('Macintosh') {
+		headers += 'Sec-Ch-Ua-Platform: "macOS"\r\n'
+		headers += 'Sec-Ch-Ua-Mobile: ?0\r\n'
+	} else if ua.contains('iPhone') {
+		headers += 'Sec-Ch-Ua-Platform: "iOS"\r\n'
+		headers += 'Sec-Ch-Ua-Mobile: ?1\r\n'
+	} else if ua.contains('Linux') {
+		headers += 'Sec-Ch-Ua-Platform: "Linux"\r\n'
+		headers += 'Sec-Ch-Ua-Mobile: ?0\r\n'
+	}
+
+	headers += 'Connection: close\r\n\r\n'
+	return headers
+}
+
 fn perform_get_request(worker_id int, mut conn Connection, u urllib.URL, ua_list []string) ! {
 	ua_idx := rand.int_in_range(0, ua_list.len) or { 0 }
 	random_ua := ua_list[ua_idx]
-	path := if u.path == '' { '/' } else { u.path }
-	host := u.hostname()
 	
-	get_request := 'GET ${path} HTTP/1.1\r\n' +
-		'Host: ${host}\r\n' +
-		'User-Agent: ${random_ua}\r\n' +
-		'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n' +
-		'Accept-Language: en-US,en;q=0.5\r\n' +
-		'Upgrade-Insecure-Requests: 1\r\n' +
-		'Connection: close\r\n\r\n'
+	mut path := if u.path == '' { '/' } else { u.path }
+	
+	if rand.f64() < 0.25 {
+		queries := ['ref=google', 'utm_source=feed', 'lang=en', 'v=${rand.int_in_range(10, 99) or { 12 }}']
+		q_idx := rand.int_in_range(0, queries.len) or { 0 }
+		if path.contains('?') {
+			path += '&' + queries[q_idx]
+		} else {
+			path += '?' + queries[q_idx]
+		}
+	}
+
+	host := u.hostname()
+	get_request := 'GET ${path} HTTP/1.1\r\n' + get_stealth_headers(random_ua, host)
 
 	conn.write_string(get_request)!
 	
