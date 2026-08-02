@@ -16,12 +16,6 @@ Envelop is a lightweight, concurrent web traffic obfuscation tool written in the
 
 To compile and run this project, you must have the [V programming language](https://vlang.io/) installed on your system.
 
-## Quick Install
-
-```sh
-apt update -y && apt install -y git clang make && if ! command -v v >/dev/null 2>&1; then git clone --depth=1 https://github.com/vlang/v && cd v && make && ./v symlink && cd ..; fi && git clone --depth=1 https://github.com/tailsmails/envelop && cd envelop && v -prod envelop.v -o envelop && ln -sf $(pwd)/envelop $PREFIX/bin/envelop
-```
-
 Build Instructions
 
 1.  Clone or download the source code to your local machine.
