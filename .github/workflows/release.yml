@@ -84,7 +84,7 @@ jobs:
 
       - name: Generate C Source
         run: |
-          v $EXTRA_FLAGS -d no_backtrace -enable-globals -autofree -os ${{ matrix.v_os }} -o $APP_NAME.c .
+          v $EXTRA_FLAGS -d no_backtrace -enable-globals -os ${{ matrix.v_os }} -o $APP_NAME.c .
 
       - name: Patch C Source
         run: |
