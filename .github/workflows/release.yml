@@ -41,14 +41,14 @@ jobs:
             runner: ubuntu-latest
             v_os: linux
             setup_cmd: ""
-            compile_cmd: $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang -O3 -fPIE -pie -U__ANDROID__ $MBED_INCS $APP_NAME.c $MBED_SRCS -o $APP_NAME$SUFFIX -lm
+            compile_cmd: $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang -O3 -fPIE -pie $MBED_INCS $APP_NAME.c $MBED_SRCS -o $APP_NAME$SUFFIX -lm
             artifact_suffix: -android-arm64
 
           - target: android-arm
             runner: ubuntu-latest
             v_os: linux
             setup_cmd: ""
-            compile_cmd: $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi28-clang -O3 -fPIE -pie -U__ANDROID__ $MBED_INCS $APP_NAME.c $MBED_SRCS -o $APP_NAME$SUFFIX -lm
+            compile_cmd: $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi28-clang -O3 -fPIE -pie $MBED_INCS $APP_NAME.c $MBED_SRCS -o $APP_NAME$SUFFIX -lm
             artifact_suffix: -android-arm
 
           - target: freebsd-amd64
@@ -85,26 +85,6 @@ jobs:
       - name: Generate C Source
         run: |
           v $EXTRA_FLAGS -d no_backtrace -enable-globals -gc none -os ${{ matrix.v_os }} -o $APP_NAME.c .
-
-      - name: Patch C Source
-        run: |
-          python3 -c "
-          import re
-          with open('$APP_NAME.c', 'r') as f:
-              text = f.read()
-
-          text = re.sub(r'static\s+void\s+mbedtls_ssl_config_free\s*\(', 'static void v_mbedtls_ssl_config_free(', text)
-          text = re.sub(r'static\s+void\s+mbedtls_x509_crt_free\s*\(', 'static void v_mbedtls_x509_crt_free(', text)
-
-          text = re.sub(r'\bmbedtls_ssl_config_free\s*\(\s*(\(?\s*&?\s*[a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+|->[a-zA-Z0-9_]+)*\s*\)?)\s*\)', 
-              lambda m: f'v_mbedtls_ssl_config_free({m.group(1)})' if 'conf' not in m.group(1) and 'mbedtls_ssl_config' not in m.group(1) else m.group(0), text)
-
-          text = re.sub(r'\bmbedtls_x509_crt_free\s*\(\s*(\(?\s*&?\s*[a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+|->[a-zA-Z0-9_]+)*\s*\)?)\s*\)', 
-              lambda m: f'v_mbedtls_x509_crt_free({m.group(1)})' if 'crt' not in m.group(1) and 'cacert' not in m.group(1) and 'mbedtls_x509_crt' not in m.group(1) else m.group(0), text)
-
-          with open('$APP_NAME.c', 'w') as f:
-              f.write(text)
-          "
 
       - name: Compile Binary
         run: ${{ matrix.compile_cmd }}
